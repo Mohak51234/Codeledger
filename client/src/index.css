@@ -1,0 +1,54 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+
+:root {
+  /* Color tokens — terminal ledger */
+  --ink: #10192E;          /* base surface, deep navy (not near-black) */
+  --ink-raised: #16223D;   /* cards / panels one step up */
+  --ink-line: #253357;     /* hairlines / dividers */
+  --paper: #EDEAE0;        /* primary text, warm off-white */
+  --paper-dim: #9AA4C0;    /* secondary text */
+  --amber: #FFB627;        /* primary accent — phosphor amber */
+  --amber-dim: #C98F1B;
+  --teal: #2EC4B6;         /* secondary accent — status / presence */
+  --coral: #EF6461;        /* leave / error */
+
+  /* Type tokens */
+  --font-display: 'IBM Plex Mono', ui-monospace, monospace;
+  --font-body: 'IBM Plex Sans', system-ui, sans-serif;
+
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--ink);
+  color: var(--paper);
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: inherit;
+}
+
+::selection {
+  background: var(--amber);
+  color: var(--ink);
+}
+
+:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}
