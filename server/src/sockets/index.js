@@ -10,10 +10,26 @@ const EVENTS = {
     CODE_CHANGE: 'code:change', // client -> server proposed edit
     CODE_ACCEPTED: 'code:accepted', // server -> all: edit applied, new version
     CODE_REJECTED: 'code:rejected', // server -> sender only: stale version, here's the truth
+    PRESENCE: 'room:presence', // server -> all: someone joined
 };
 
-// socketId -> { userId, username, roomId }
-const presence = new Map();
+// roomId -> a promise chain of pending writes for that room. findOneAndUpdate
+// is atomic per-call, but nothing guarantees two calls issued close together
+// (even from the same client) reach MongoDB and commit in the order they
+// were sent -- the driver's connection pool can let them race. Funneling
+// every write for a given room through this queue forces them to actually
+// execute one at a time, in arrival order, which is what the client's
+// optimistic version bump assumes is true.
+const roomWriteQueues = new Map();
+
+function runSerialized(roomId, task) {
+    const previous = roomWriteQueues.get(roomId) || Promise.resolve();
+    const next = previous.then(task, task); // run even if the prior write errored
+    // swallow errors here so the queue itself never gets stuck rejected;
+    // the actual error is still handled/returned by `task` itself
+    roomWriteQueues.set(roomId, next.catch(() => {}));
+    return next;
+}
 
 export function initSockets(httpServer, corsOrigin) {
     const io = new Server(httpServer, { cors: { origin: corsOrigin } });
@@ -41,12 +57,8 @@ export function initSockets(httpServer, corsOrigin) {
             }
 
             socket.join(roomId);
-            presence.set(socket.id, {
-                userId: socket.user.id,
-                username: socket.user.username,
-                roomId,
-                joinedAt: Date.now(),
-            });
+            socket.roomId = roomId; // track which room this socket is in for disconnect handling
+            socket.joinedAt = Date.now(); // track when this socket joined for roster info
 
             // Server sends the authoritative, persisted state directly —
             // it does not depend on another connected peer to relay it.
@@ -56,69 +68,62 @@ export function initSockets(httpServer, corsOrigin) {
             });
 
             broadcastRoster(io, roomId);
-            socket.to(roomId).emit('room:presence', {
+            socket.to(roomId).emit(EVENTS.PRESENCE, {
                 type: 'join',
                 username: socket.user.username,
             });
         });
 
         socket.on(EVENTS.CODE_CHANGE, async ({ roomId, code, baseVersion }) => {
-            // Atomic compare-and-swap: the filter requires the document to
-            // still be at `baseVersion` at the moment MongoDB applies the
-            // update. This closes a race that a naive findOne -> mutate ->
-            // save would have — two near-simultaneous writes reading the
-            // same version and both believing they're valid. With
-            // findOneAndUpdate, MongoDB itself guarantees only one of them
-            // can match and apply; the other simply finds no matching
-            // document and falls through to the rejection path below.
-            const updated = await Room.findOneAndUpdate(
-                { roomId, version: baseVersion },
-                {
-                    $set: { code, lastActiveAt: new Date() },
-                    $inc: { version: 1 },
-                },
-                { new: true }
-            );
 
-            if (!updated) {
-                // Either the room doesn't exist, or baseVersion was stale —
-                // fetch the authoritative current state so the client can
-                // reconcile instead of silently losing the edit.
-                const current = await Room.findOne({ roomId });
-                if (!current) return;
-                socket.emit(EVENTS.CODE_REJECTED, {
-                    code: current.code,
-                    version: current.version,
+            await runSerialized(roomId, async () => {
+                const updated = await Room.findOneAndUpdate(
+                    { roomId, version: baseVersion },
+                    {
+                        $set: { code, lastActiveAt: new Date() },
+                        $inc: { version: 1 },
+                    },
+                    { new: true }
+                );
+
+                if (!updated) {
+                    const current = await Room.findOne({ roomId });
+                    if (!current) return;
+                    socket.emit(EVENTS.CODE_REJECTED, {
+                        code: current.code,
+                        version: current.version,
+                    });
+                    return;
+                }
+
+                io.to(roomId).emit(EVENTS.CODE_ACCEPTED, {
+                    code: updated.code,
+                    version: updated.version,
+                    from: socket.user.username,
                 });
-                return;
-            }
-
-            io.to(roomId).emit(EVENTS.CODE_ACCEPTED, {
-                code: updated.code,
-                version: updated.version,
-                from: socket.user.username,
             });
         });
 
-        socket.on('disconnect', () => {
-            const info = presence.get(socket.id);
-            if (!info) return;
-            presence.delete(socket.id);
+        socket.on('disconnect', async () => {
+            if (!socket.roomId) return;
 
-            socket.to(info.roomId).emit(EVENTS.LEFT, {
-                username: info.username,
+            socket.to(socket.roomId).emit(EVENTS.LEFT, {
+                username: socket.user.username,
             });
-            broadcastRoster(io, info.roomId);
+
+            await broadcastRoster(io, socket.roomId);
         });
     });
 
     return io;
 }
 
-function broadcastRoster(io, roomId) {
-    const roster = [...presence.values()]
-        .filter((p) => p.roomId === roomId)
-        .map((p) => ({ username: p.username, joinedAt: p.joinedAt }));
+async function broadcastRoster(io, roomId) {
+    const sockets = await io.in(roomId).fetchSockets();
+    const roster = sockets.map((s) => ({
+        username: s.user.username,
+        joinedAt: s.joinedAt,
+    }));
     io.to(roomId).emit(EVENTS.ROSTER, roster);
 }
 
