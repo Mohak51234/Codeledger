@@ -18,6 +18,8 @@ const EditorPage = () => {
     const editorApiRef = useRef(null);
     const versionRef = useRef(0);
     const debounceRef = useRef(null);
+    const pendingEditRef = useRef(null);
+    const waitingForAckRef = useRef(false);
 
     const [clients, setClients] = useState([]);
     const [log, setLog] = useState([]);
@@ -65,45 +67,59 @@ const EditorPage = () => {
             pushLog('leave', `${username} left`);
         });
 
-        socket.on('code:accepted', ({ code, version, from }) => {
+        socket.on("code:accepted", ({ code, version, from }) => {
             versionRef.current = version;
+            waitingForAckRef.current = false;
+
             if (from !== auth.username) {
-                editorApiRef.current?.setCode(code);
+                editorApiRef.current.setCode(code);
             }
-            pushLog('sync', `${from} edited (v${version})`);
+
+            // If user typed while waiting, send newest state now.
+            if (pendingEditRef.current !== null) {
+                const latest = pendingEditRef.current;
+                pendingEditRef.current = null;
+                sendEdit(latest);
+            }
         });
 
-        socket.on('code:rejected', ({ code, version }) => {
+        socket.on("code:rejected", ({ code, version }) => {
             versionRef.current = version;
-            editorApiRef.current?.setCode(code);
-            toast('Someone edited at the same time — synced to latest', {
-                icon: '⚠️',
-            });
-            pushLog('sync', `conflict — resynced to v${version}`);
+            waitingForAckRef.current = false;
+
+            editorApiRef.current.setCode(code);
+
+            if (pendingEditRef.current !== null) {
+                const latest = pendingEditRef.current;
+                pendingEditRef.current = null;
+                sendEdit(latest);
+            }
         });
 
         return () => socket.disconnect();
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [roomId]);
 
+    const sendEdit = (code) => {
+        waitingForAckRef.current = true;
+
+        socketRef.current.emit("code:change", {
+            roomId,
+            code,
+            baseVersion: versionRef.current,
+        });
+    };
+
     const handleLocalChange = (code) => {
-        // Coalesce rapid keystrokes into one round trip instead of one
-        // network + DB write per character — this is also what keeps a
-        // single fast-typing user from racing their own unacknowledged edits.
+        pendingEditRef.current = code;
+
         clearTimeout(debounceRef.current);
         debounceRef.current = setTimeout(() => {
-            const baseVersion = versionRef.current;
-            socketRef.current?.emit('code:change', { roomId, code, baseVersion });
+            if (waitingForAckRef.current) return;
 
-            // Optimistically assume this edit will be accepted, rather than
-            // waiting for the round trip to update our version. This is safe
-            // because Socket.IO preserves message order on a single
-            // connection, so our own successive edits arrive at the server
-            // in the order we sent them. If another user's edit genuinely
-            // interleaves before ours lands, the server's compare-and-swap
-            // will still correctly reject us — `code:rejected` then
-            // reconciles versionRef.current back to the true value.
-            versionRef.current = baseVersion + 1;
+            const code = pendingEditRef.current;
+            pendingEditRef.current = null;
+            sendEdit(code);
         }, 200);
     };
 
